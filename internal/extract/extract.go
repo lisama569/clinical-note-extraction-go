@@ -35,6 +35,7 @@ type Mention struct {
 	Segment   segment.Segment
 	Polarity  Polarity
 	Rationale string // 判定依据：命中的修饰词与作用域说明
+	Abbrev    bool   // 是否来自缩写命中（版本对照时按词面归组）
 }
 
 // certainty 返回极性的确定性优先级，数值越大越确定。
@@ -184,6 +185,7 @@ func resolve(seg segment.Segment, toks []token) []Mention {
 			m.Polarity, m.Rationale = polarityOf(seg.Text, toks, tok)
 		case len(tok.abbrev) > 0:
 			m.ConceptID, m.Polarity, m.Rationale = disambiguate(seg, tok)
+			m.Abbrev = true
 			if m.Polarity != Pending {
 				pol, rat := polarityOf(seg.Text, toks, tok)
 				m.Polarity, m.Rationale = pol, m.Rationale+"; "+rat
