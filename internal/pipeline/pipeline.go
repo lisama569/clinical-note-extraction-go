@@ -2,6 +2,8 @@
 package pipeline
 
 import (
+	"fmt"
+
 	"github.com/lisama569/clinical-note-extraction-go/internal/extract"
 	"github.com/lisama569/clinical-note-extraction-go/internal/segment"
 	"github.com/lisama569/clinical-note-extraction-go/internal/terminology"
@@ -30,7 +32,21 @@ func New(reg *terminology.Registry) *Pipeline {
 // 整份文档的分节、抽取与归并都基于同一不可变字典，不会混用新旧术语；
 // 同一 (docID, text) 在同一版本下重复处理的结果完全一致。
 func (p *Pipeline) Process(docID, text string) Result {
-	dict := p.reg.Snapshot()
+	return p.processWith(p.reg.Snapshot(), docID, text)
+}
+
+// ProcessVersion 用指定术语版本处理一份文档；版本不存在时返回错误。
+// 与 Process 一样，整份文档只基于这一个版本的不可变字典。
+func (p *Pipeline) ProcessVersion(docID, text, version string) (Result, error) {
+	dict := p.reg.Version(version)
+	if dict == nil {
+		return Result{}, fmt.Errorf("术语版本不存在: %q", version)
+	}
+	return p.processWith(dict, docID, text), nil
+}
+
+// processWith 是版本无关的处理主体：dict 在调用前已钉住。
+func (p *Pipeline) processWith(dict *terminology.Dictionary, docID, text string) Result {
 	segs := segment.Split(text, dict.SectionSet)
 	mentions, conclusions := extract.Extract(segs, dict)
 	return Result{

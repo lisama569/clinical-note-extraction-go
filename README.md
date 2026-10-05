@@ -10,6 +10,7 @@ internal/segment      分节与句子切分：自由文本 → 带原文位置�
 internal/terminology  不可变的带版本术语资源 + 并发安全的版本注册表
 internal/extract      概念抽取、否定/不确定判定、缩写消歧、结论归并
 internal/pipeline     串联以上步骤，保证每份文档整体基于同一术语版本
+internal/batch        批量重放（并发限制、中途取消）与新旧版本对照
 ```
 
 ## 分节与切分规则（segment）
@@ -44,6 +45,63 @@ internal/pipeline     串联以上步骤，保证每份文档整体基于同一�
 - 历史版本永久保留在注册表中，可随时 `Switch` 回退；升级或回退不会改变已产出结果
   （结果对象记录 `TermVersion`，且字典不可变）。
 
+## 批量重放（batch.Runner）
+
+在单文档管线之上一次提交多份病历，整批钉住同一个指定术语版本：
+
+```go
+reg := terminology.NewRegistry(dictV1)
+reg.Register(dictV2)
+runner := &batch.Runner{
+    Pipeline:       pipeline.New(reg),
+    Registry:       reg,
+    MaxConcurrency: 8,              // 并发上限；<=0 时默认 4
+    Logger:         log.New(os.Stderr, "", 0), // 可选：逐份记录版本与判定依据
+}
+rep := runner.Run(ctx, "v2", []batch.Document{{ID: "doc1", Text: "..."}, ...})
+```
+
+- 每份文档带唯一 `ID`；`Report.Results` **按提交顺序**返回，与并发度、各文档完成
+  先后顺序无关——同样的输入与版本组合重复执行，报告逐字节一致。
+- 批内每份文档整体只使用提交时指定的版本（入口钉住不可变快照），不会新旧混判。
+- **异常约定**（逐份标注，不默默跳过，也不影响批内其它文档）：
+  - 指定版本不存在：整批每份都标记 `failed`，原因含版本号；
+  - 文档标识为空/重复、内容为空：仅该份标记 `failed` 并注明可区分的原因；
+  - 处理过程发生 panic：回收为该份的 `failed`，其余文档照常完成。
+- **取消约定**（`ctx` 取消）：
+  - 已处理完的文档结果完整保留（版本、结论、依据齐全）；
+  - 还没轮到的文档标记 `not_processed`，不携带结果；
+  - 进行中的文档会完整跑完，不会出现半份文档混两个版本判定。
+- `Report.Summary` 汇总 total/succeeded/failed/not_processed 计数。
+- 配置 `Logger` 后，日志逐份记录 `doc=<ID> version=<版本>`、每条结论的极性与判定依据、
+  待定提及的候选与原因，以及失败/未处理文档的原因。
+
+## 版本对照（batch.Compare）
+
+同一批病历分别用新旧两个版本各跑一遍，再对照两份报告：
+
+```go
+oldRep := runner.Run(ctx, "v1", docs)
+newRep := runner.Run(ctx, "v2", docs)
+cmp := batch.Compare(oldRep, newRep)
+```
+
+`Comparison.Changes` 按 `(DocID, Subject, Kind)` 排序，列出：
+
+- `added` / `removed`：只在新/旧版本出现的结论；
+- `polarity_changed`：两版都有但极性不同的结论；
+- `pending_to_decided` / `decided_to_pending`：缩写从无法判定变为能判定（或反过来）。
+
+每条变化的 `Old`/`New` 两侧都携带版本号、极性与判定依据，可逐条追溯。
+任一版本中未成功处理的文档列入 `Comparison.Skipped` 并注明原因，不参与对照也不被丢弃。
+对照是纯函数：同样的两份报告重复对照结果完全一致，不受批内处理顺序与并发度影响。
+
+## 版本兼容范围
+
+- 历史版本字典永久保留在 `Registry` 中（只增不改），任意历史版本都可用于重放与对照；
+- 请求未注册的版本号时批量执行整批失败并逐份注明，不会退回到其它版本静默处理；
+- 对照要求两份报告来自**同一批输入文档**（按 `ID` 配对）；缺少配对的文档进入 `Skipped`。
+
 ## 本地验证
 
 ```sh
@@ -51,8 +109,11 @@ go build ./...
 go test ./...          # 全部单元测试
 go test ./... -race    # 含并发路径的竞态检测
 go test ./internal/extract/ -v   # 日志中打印原文片段、命中规则与判定依据
+go test ./internal/batch/ -v     # 日志中打印每份文档的版本、结论依据与变化对照
 ```
 
 测试覆盖：修饰词作用域（跨分句、转折词、否定优先）、缩写歧义（小节线索/关键词线索/待定）、
 术语版本升级与回退、并发处理中的版本一致性、重复处理结果逐字节一致、
-畸形文本（无标题、截断、重复小节、空文本）的可区分失败原因。
+畸形文本（无标题、截断、重复小节、空文本）的可区分失败原因；
+批量层的部分文档失败、请求不存在的版本、开始前与进行中取消、不同并发度下报告一致、
+版本对照在重复执行/乱序提交/不同并发度下完全一致、失败文档进入对照跳过清单。
